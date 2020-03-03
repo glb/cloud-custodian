@@ -45,6 +45,7 @@ DEFAULT_TAG = "maid_status"
 def register_ec2_tags(filters, actions):
     filters.register('marked-for-op', TagActionFilter)
     filters.register('tag-count', TagCountFilter)
+    filters.register('valid-until', ValidUntilFilter)
 
     actions.register('auto-tag-user', AutoTagUser)
     actions.register('mark-for-op', TagDelayedAction)
@@ -326,6 +327,94 @@ class TagActionFilter(Filter):
 
         try:
             action_date = parse(action_date_str)
+        except Exception:
+            self.log.warning("could not parse tag:%s value:%s on %s" % (
+                tag, v, i['InstanceId']))
+
+        if self.current_date is None:
+            self.current_date = datetime.now()
+
+        if action_date.tzinfo:
+            # if action_date is timezone aware, set to timezone provided
+            action_date = action_date.astimezone(tz)
+            self.current_date = datetime.now(tz=tz)
+
+        return self.current_date >= (
+            action_date - timedelta(days=skew, hours=skew_hours))
+
+
+class ValidUntilFilter(Filter):
+    """Filter resources that have passed their "valid until" date
+
+    Filters resources by a 'valid_until' tag which specifies a future
+    date for termination.
+
+    The filter parses the tag values looking for a 'date'
+    string. The date is parsed and compared to do today's date, the
+    filter succeeds if today's date is gte to the target date.
+
+    The optional 'skew' parameter provides for incrementing today's
+    date a number of days into the future. An example use case might
+    be sending a final notice email a few days before terminating an
+    instance, or snapshotting a volume prior to deletion.
+
+    The optional 'skew_hours' parameter provides for incrementing the current
+    time a number of hours into the future.
+
+    Optionally, the 'tz' parameter can get used to specify the timezone
+    in which to interpret the clock (default value is 'utc')
+
+    .. code-block :: yaml
+
+      policies:
+        - name: ec2-stop-expired
+          resource: ec2
+          filters:
+            - type: valid-until
+              # The default tag used is valid_until
+              # but that is configurable
+              tag: valid_until
+              # Another optional tag is skew
+              tz: utc
+          actions:
+            - type: stop
+
+    """
+    schema = utils.type_schema(
+        'valid-until',
+        tag={'type': 'string'},
+        tz={'type': 'string'},
+        skew={'type': 'number', 'minimum': 0},
+        skew_hours={'type': 'number', 'minimum': 0})
+    schema_alias = True
+
+    current_date = None
+
+    def validate(self):
+        tz = tzutil.gettz(Time.TZ_ALIASES.get(self.data.get('tz', 'utc')))
+        if not tz:
+            raise PolicyValidationError(
+                "Invalid timezone specified '%s' in %s" % (
+                    self.data.get('tz'), self.manager.data))
+        return self
+
+    def __call__(self, i):
+        tag = self.data.get('tag', DEFAULT_TAG)
+        skew = self.data.get('skew', 0)
+        skew_hours = self.data.get('skew_hours', 0)
+        tz = tzutil.gettz(Time.TZ_ALIASES.get(self.data.get('tz', 'utc')))
+
+        v = None
+        for n in i.get('Tags', ()):
+            if n['Key'] == tag:
+                v = n['Value']
+                break
+
+        if v is None:
+            return False
+
+        try:
+            action_date = parse(v)
         except Exception:
             self.log.warning("could not parse tag:%s value:%s on %s" % (
                 tag, v, i['InstanceId']))
